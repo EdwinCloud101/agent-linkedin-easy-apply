@@ -26,7 +26,7 @@ from langchain_deepseek import ChatDeepSeek
 from playwright.async_api import async_playwright
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-load_dotenv(os.path.join(BASE_DIR, ".env"))
+load_dotenv()  # nearest .env up from here: repo root in a monorepo, or this folder standalone
 
 INSTRUCTION_FILE = os.path.join(BASE_DIR, "instructions.md")  # search filter + answering policy
 RESUME_PDF = os.path.join(BASE_DIR, "resume.pdf")             # your resume (not tracked)
