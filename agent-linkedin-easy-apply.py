@@ -16,9 +16,19 @@ import asyncio
 import datetime
 import os
 import re
+import sys
 from urllib.parse import urlencode
 
+# LinkedIn text and the model's replies contain non-cp1252 chars (emoji, em dashes);
+# force UTF-8 so logging never crashes on Windows' default console encoding.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 from dotenv import load_dotenv
+from pypdf import PdfReader
 from langchain.agents import create_agent
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.tools import tool
@@ -29,12 +39,9 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 load_dotenv()  # nearest .env up from here: repo root in a monorepo, or this folder standalone
 
 INSTRUCTION_FILE = os.path.join(BASE_DIR, "instructions.md")  # search filter + answering policy
-RESUME_PDF = os.path.join(BASE_DIR, "resume.pdf")             # your resume (not tracked)
-USER_DATA_DIR = os.path.join(BASE_DIR, ".linkedin-profile")   # persistent LinkedIn login
 DATA_DIR = os.path.join(BASE_DIR, "data")                     # output
 TOKEN_LOG = os.path.join(BASE_DIR, "tokens.txt")
 
-APPLY_TARGET = 10
 DEEPSEEK_MODEL = "deepseek-v4-flash"
 RECURSION_LIMIT = 500
 
@@ -55,20 +62,30 @@ US_STATES = {
 
 # --- Token logging -----------------------------------------------------------
 
+def _short(text, n=300):
+    return " ".join(str(text).split())[:n]
+
+
 class TokenLogger(BaseCallbackHandler):
-    """Prepend 'in N out N' to TOKEN_LOG after every LLM call (newest on top)."""
+    """Log token usage to TOKEN_LOG, and print a full trace of the agent's actions:
+    its reasoning (on_llm_end), each tool call (on_tool_start) and result (on_tool_end)."""
 
     def __init__(self, path):
         self.path = path
         self.total_in = 0
         self.total_out = 0
+        self.step = 0
 
     def on_llm_end(self, response, **kwargs):
         tin = tout = 0
         try:
-            usage = getattr(response.generations[0][0].message, "usage_metadata", None) or {}
+            msg = response.generations[0][0].message
+            usage = getattr(msg, "usage_metadata", None) or {}
             tin = usage.get("input_tokens", 0)
             tout = usage.get("output_tokens", 0)
+            text = (getattr(msg, "content", "") or "").strip()
+            if text:
+                print(f"[THINK] {_short(text, 500)}", flush=True)
         except Exception:
             pass
         self.total_in += tin
@@ -80,6 +97,19 @@ class TokenLogger(BaseCallbackHandler):
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
         with open(self.path, "w", encoding="utf-8") as f:
             f.write(f"in {tin} out {tout}\n" + old)
+
+    def on_tool_start(self, serialized, input_str, **kwargs):
+        self.step += 1
+        name = (serialized or {}).get("name", "tool")
+        arg = kwargs.get("inputs") or input_str
+        print(f"[{self.step:03d}] -> {name}({_short(arg, 160)})", flush=True)
+
+    def on_tool_end(self, output, **kwargs):
+        out = getattr(output, "content", output)
+        print(f"        = {_short(out, 300)}", flush=True)
+
+    def on_tool_error(self, error, **kwargs):
+        print(f"        ! tool error: {_short(error, 300)}", flush=True)
 
 
 # --- Plain helpers (no page / no AI) -----------------------------------------
@@ -127,6 +157,20 @@ def extract_section(text, header):
     return "\n".join(out).strip()
 
 
+def read_setting(key: str, default: str = "") -> str:
+    """Read a single `key: value` line from the '## Search filter' section."""
+    if not os.path.isfile(INSTRUCTION_FILE):
+        return default
+    text = open(INSTRUCTION_FILE, encoding="utf-8").read()
+    for line in extract_section(text, "## Search filter").splitlines():
+        line = line.strip()
+        if ":" in line:
+            k, _, v = line.partition(":")
+            if k.strip().lower() == key:
+                return v.strip() or default
+    return default
+
+
 def read_instruction(path: str) -> dict:
     """Parse the '## Search filter' section into LinkedIn URL params."""
     if not os.path.isfile(path):
@@ -154,12 +198,26 @@ def read_instruction(path: str) -> dict:
     return params
 
 
+def read_resume_text(path: str) -> str:
+    """Extract the resume's text so the agent can answer questions from real experience."""
+    if not os.path.isfile(path):
+        return ""
+    try:
+        reader = PdfReader(path)
+        text = "\n".join((page.extract_text() or "") for page in reader.pages)
+        return re.sub(r"\n{3,}", "\n\n", text).strip()
+    except Exception as e:
+        print(f"warning: could not read resume {path}: {e}", flush=True)
+        return ""
+
+
 def distill_instructions() -> str:
     """The answering policy + screening answers the agent uses to fill forms."""
     if not os.path.isfile(INSTRUCTION_FILE):
         return ""
     text = open(INSTRUCTION_FILE, encoding="utf-8").read()
     return (
+        f"Blacklist (skip any job matching these):\n{extract_section(text, '## Blacklist')}\n\n"
         f"Answering policy:\n{extract_section(text, '## Answering policy')}\n\n"
         f"Screening answers:\n{extract_section(text, '## Screening question answers')}"
     ).strip()
@@ -247,13 +305,36 @@ JOBS_URL = "https://www.linkedin.com/jobs/search/?" + urlencode(SEARCH_PARAMS)
 KEYWORD = SEARCH_PARAMS.get("keywords", "jobs")
 LOCATION = SEARCH_PARAMS.get("location", "")
 OUT_DIR = os.path.join(DATA_DIR, f"{slugify(KEYWORD)}-{location_slug(LOCATION)}")
+RESUME_PDF = os.path.join(BASE_DIR, read_setting("resume", "data/input/resume.pdf"))
+USER_DATA_DIR = os.path.join(BASE_DIR, read_setting("profile", ".linkedin-profile"))
+APPLY_TARGET = int(read_setting("limit", "10"))  # how many jobs to apply to this run
 DISTILLED = distill_instructions()
+RESUME_TEXT = read_resume_text(RESUME_PDF)  # fed to the agent so it answers from real experience
 
 S = {"page": None, "context": None, "applied": 0, "target": APPLY_TARGET, "cur": {}}
 
 
 def _page():
     return S["page"]
+
+
+async def _goto(page, url, wait_sel=None, sel_timeout=20000):
+    """Navigate, tolerating ERR_ABORTED (LinkedIn handles query-only URL changes as a
+    same-document SPA route, which aborts the full navigation but still loads the content).
+    Returns True if wait_sel appeared (or none was requested)."""
+    try:
+        await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+    except Exception as e:
+        if "ERR_ABORTED" not in str(e):
+            raise
+        await page.wait_for_timeout(1200)  # let the SPA finish the client-side route
+    if not wait_sel:
+        return True
+    try:
+        await page.wait_for_selector(wait_sel, timeout=sel_timeout)
+        return True
+    except Exception:
+        return False
 
 
 def write_applied_md(cur) -> str:
@@ -279,10 +360,7 @@ def write_applied_md(cur) -> str:
 async def go_to_search() -> str:
     """Open the LinkedIn jobs search (filtered per instructions.md). Call once at the start."""
     page = _page()
-    await page.goto(JOBS_URL, wait_until="domcontentloaded", timeout=60000)
-    try:
-        await page.wait_for_selector("li[data-occludable-job-id]", timeout=20000)
-    except Exception:
+    if not await _goto(page, JOBS_URL, "li[data-occludable-job-id]", 20000):
         return "search opened but no jobs visible"
     return f"search opened: {page.url}"
 
@@ -298,10 +376,21 @@ async def list_jobs() -> str:
         except Exception:
             pass
         await page.wait_for_timeout(800)
-    items = await page.evaluate(
+    data = await page.evaluate(
         """() => {
+            const noResults = !!document.querySelector('.jobs-search-no-results-banner');
+            // LinkedIn appends unfiltered suggestions under headings like these once the
+            // filtered results run out -- they must NOT be treated as search results.
+            let rec = null;
+            for (const e of document.querySelectorAll('h2,h3,.jobs-search-results-list__subtitle,span')) {
+                if (/jobs you may be interested in|similar jobs|people also viewed|you may be interested/i.test(e.innerText || '')) { rec = e; break; }
+            }
+            const cards = [...document.querySelectorAll('li[data-occludable-job-id]')];
+            const kept = rec
+                ? cards.filter(li => rec.compareDocumentPosition(li) & Node.DOCUMENT_POSITION_PRECEDING)
+                : cards;
             const out = [];
-            document.querySelectorAll('li[data-occludable-job-id]').forEach(li => {
+            kept.forEach(li => {
                 const id = li.getAttribute('data-occludable-job-id');
                 if (!id) return;
                 const applied = /\\bApplied\\b/.test(li.innerText || '');
@@ -309,21 +398,26 @@ async def list_jobs() -> str:
                 const title = (a ? a.innerText : (li.innerText || '')).replace(/\\s+/g, ' ').trim().slice(0, 60);
                 out.push({ id, applied, title });
             });
-            return out;
+            return { noResults, hidden: cards.length - kept.length, items: out };
         }"""
     )
+    items, hidden = data["items"], data["hidden"]
+    if data["noResults"] and not items:
+        return ("FILTERED RESULTS EXHAUSTED: no jobs match the filter here. Do NOT open any "
+                "'jobs you may be interested in' suggestions -- they ignore your filter. "
+                "Try next_page; if that is also empty, reply DONE and stop.")
+    if not items:
+        return "no jobs visible"
     lines = [f"{it['id']} | {'APPLIED' if it['applied'] else 'new'} | {it['title']}" for it in items[:25]]
-    return "JOBS (open ONLY the 'new' ones):\n" + "\n".join(lines) if lines else "no jobs visible"
+    note = f"\n({hidden} off-filter 'suggested' jobs hidden -- ignore those)" if hidden else ""
+    return "JOBS (open ONLY the 'new' ones):\n" + "\n".join(lines) + note
 
 
 @tool
 async def next_page(start: int) -> str:
     """Load the next page of results. start = 25, 50, 75, ... 'no more results' when exhausted."""
     page = _page()
-    await page.goto(JOBS_URL + f"&start={start}", wait_until="domcontentloaded", timeout=60000)
-    try:
-        await page.wait_for_selector("li[data-occludable-job-id]", timeout=15000)
-    except Exception:
+    if not await _goto(page, JOBS_URL + f"&start={start}", "li[data-occludable-job-id]", 15000):
         return "no more results"
     return f"page start={start} loaded"
 
@@ -332,10 +426,7 @@ async def next_page(start: int) -> str:
 async def open_job(job_id: str) -> str:
     """Open a job's detail pane by its id (resets the current-job context)."""
     page = _page()
-    await page.goto(JOBS_URL + f"&currentJobId={job_id}", wait_until="domcontentloaded", timeout=60000)
-    try:
-        await page.wait_for_selector(".jobs-description__content, #job-details", timeout=20000)
-    except Exception:
+    if not await _goto(page, JOBS_URL + f"&currentJobId={job_id}", ".jobs-description__content, #job-details", 20000):
         return "opened but no description pane"
     await page.wait_for_timeout(1200)
     for sel in (".jobs-description__footer-button", "button.show-more-less-html__button"):
@@ -348,6 +439,7 @@ async def open_job(job_id: str) -> str:
                 pass
             break
     S["cur"] = {"job_id": str(job_id)}
+    print(f"[OPEN] job {job_id}", flush=True)
     return f"opened job {job_id}"
 
 
@@ -522,6 +614,8 @@ async def submit_application() -> str:
         return "CONFIRMED but read_job was not called first, so nothing was saved. Call read_job before applying next time."
     S["applied"] += 1
     base = os.path.basename(write_applied_md(S["cur"]))
+    print(f"[APPLIED {S['applied']}/{S['target']}] {S['cur'].get('company','?')} — "
+          f"{S['cur'].get('title','?')}  ({base})", flush=True)
     if S["applied"] >= S["target"]:
         return f"APPLIED + CONFIRMED ({S['applied']}/{S['target']}), saved {base}. TARGET REACHED — reply DONE and stop."
     return f"APPLIED + CONFIRMED ({S['applied']}/{S['target']}), saved {base}. Move on to the next job."
@@ -555,6 +649,8 @@ async def click_button(text: str) -> str:
 async def skip_job(reason: str) -> str:
     """Skip the current job (external or can't complete) and move on. Nothing is saved."""
     await close_any_modal(_page())
+    cur = S["cur"]
+    print(f"[SKIP] job {cur.get('job_id','?')} {cur.get('company','')}: {reason}", flush=True)
     return f"skipped: {reason}"
 
 
@@ -575,13 +671,20 @@ SYSTEM = (
     "then submit_application. Use choose_option for radio/checkbox, select_dropdown for "
     "real dropdowns.\n\n"
     "YOU MUST ACTUALLY APPLY to every 'new' job — carry it through submit_application until "
-    "CONFIRMED. Do NOT skip_job unless open_easy_apply reported EXTERNAL. If read_form shows "
-    "a reminder/interstitial (e.g. 'Continue applying'), use click_button to proceed. After "
-    "a CONFIRMED submission, move on. Only a CONFIRMED submission counts. When you reach the "
-    "target, reply DONE and stop.\n\n"
-    "Answer screening questions using the answering policy and screening answers below — "
-    "never leave a required field blank.\n\n"
-    f"CANDIDATE DATA AND POLICY:\n{DISTILLED}"
+    "CONFIRMED. skip_job ONLY when: open_easy_apply reported EXTERNAL, OR the job matches the "
+    "Blacklist below (blacklisted company, or the form asks for education dates / an "
+    "unselectable school-degree). Judge the blacklist yourself from the job, company, and "
+    "each form you read — the moment a job matches, call skip_job and move on; never guess "
+    "education dates. If read_form shows a reminder/interstitial (e.g. 'Continue applying'), "
+    "use click_button to proceed. After a CONFIRMED submission, move on. Only a CONFIRMED "
+    "submission counts. When you reach the target, reply DONE and stop.\n\n"
+    "Answer screening questions from the candidate's RESUME below (real experience: years, "
+    "skills, titles, employers, education), guided by the answering policy and screening "
+    "answers. The questions vary every time — reason from the resume for anything factual "
+    "(e.g. 'how many years of X', 'do you know Y'); use the screening answers for fixed "
+    "items (work authorization, salary, EEO). Never leave a required field blank.\n\n"
+    f"CANDIDATE RESUME:\n{RESUME_TEXT or '(no resume text available)'}\n\n"
+    f"POLICY AND SCREENING ANSWERS:\n{DISTILLED}"
 )
 
 GOAL = (
@@ -591,7 +694,7 @@ GOAL = (
 )
 
 token_logger = TokenLogger(TOKEN_LOG)
-llm = ChatDeepSeek(model=DEEPSEEK_MODEL, callbacks=[token_logger])
+llm = ChatDeepSeek(model=DEEPSEEK_MODEL)
 agent = create_agent(llm, TOOLS, system_prompt=SYSTEM)
 
 
@@ -607,7 +710,7 @@ async def main():
         try:
             result = await agent.ainvoke(
                 {"messages": [{"role": "user", "content": GOAL}]},
-                config={"recursion_limit": RECURSION_LIMIT},
+                config={"recursion_limit": RECURSION_LIMIT, "callbacks": [token_logger]},
             )
             msgs = result.get("messages", []) if isinstance(result, dict) else []
             if msgs:

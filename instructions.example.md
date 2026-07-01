@@ -9,6 +9,21 @@ location: United States
 date_posted: 1 week
 easy_apply: true
 remote: true
+resume: data/input/resume.pdf
+profile: .linkedin-profile
+limit: 10
+
+## Blacklist
+Judge each job against these as you go. If a job matches ANY item, call skip_job
+immediately and move on — never apply, never partially fill it. This overrides the
+answering policy: when in doubt between applying and skipping a blacklisted job, SKIP.
+- Company (match loosely, including obvious name variants and misspellings): Example Corp.
+- Any application that asks you to enter or select EDUCATION DATES (start date, end date,
+  graduation date, dates attended, year of graduation) for a school/degree. Do NOT guess
+  dates and do NOT fight the field — skip the whole job.
+- Any REQUIRED field that makes you pick a specific school / university / degree from a
+  list and yours is not selectable.
+- Add more companies or criteria below, one per line.
 
 ## Answering policy
 You genuinely want the job — answer to maximize getting an interview, make the best
@@ -25,8 +40,7 @@ field blank.
 - Reminders / interstitials / confirmation pop-ups (e.g. a "safety reminder" with "Continue
   applying"): always proceed — click the button that continues; never "Review", "Cancel",
   or anything that backs out.
-- If a REQUIRED field makes you pick a specific college / university / degree from a list
-  and yours cannot be selected, skip that job.
+- If a job matches the Blacklist above, skip it (call skip_job) instead of applying.
 
 ## Screening question answers
 Set these to your own values.
