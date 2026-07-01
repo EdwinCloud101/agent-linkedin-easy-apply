@@ -1,0 +1,32 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# --- Virtual environments ---
+.venv/
+venv/
+env/
+
+# --- Secrets & personal data (NEVER commit) ---
+.env
+*.key
+resume.pdf
+instructions.md
+
+# --- Browser profile (contains a live LinkedIn session) ---
+.linkedin-profile/
+*-profile/
+
+# --- Output + logs ---
+data/
+tokens.txt
+
+# --- IDE / OS ---
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
